@@ -31,6 +31,9 @@ st.set_page_config(page_title="GitHub Issue Triage (NLP-46)", page_icon="🛠️
 # ---------------- CUSTOM CSS ----------------
 st.markdown("""
 <style>
+    [data-testid="stToolbar"] { visibility: hidden; }
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
     .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
     .hero-card {
         background: linear-gradient(135deg, #161b22 0%, #1f2937 55%, #0d1117 100%);
@@ -39,8 +42,13 @@ st.markdown("""
         padding: 1.5rem 2rem;
         margin-bottom: 1.2rem;
     }
-    .hero-title { font-size: 1.95rem; font-weight: 700; color: #f0f6fc; margin: 0; }
-    .hero-sub { color: #8b949e; font-size: 0.96rem; margin-top: 0.35rem; margin-bottom: 0; }
+    .hero-title {
+        font-size: 2.6rem !important;
+        font-weight: 800;
+        color: #f0f6fc;
+        margin: 0;
+        line-height: 1.2;
+    }
     .kpi-card {
         background: #161b22;
         border: 1px solid #30363d;
@@ -165,8 +173,7 @@ with st.sidebar:
 # ---------------- HERO BANNER ----------------
 st.markdown("""
 <div class="hero-card">
-    <p class="hero-title">🛠️ GitHub Issue Classifier & Duplicate Bug Detector</p>
-    <p class="hero-sub">CSB306 NLP Project (NLP-46) · Automated Real-Time Issue Triage powered by DistilBERT & Sentence-BERT</p>
+    <h1 class="hero-title">🛠️ GitHub Issue Classifier & Duplicate Bug Detector</h1>
 </div>
 """, unsafe_allow_html=True)
 
