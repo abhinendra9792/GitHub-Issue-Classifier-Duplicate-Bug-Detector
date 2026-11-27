@@ -1,4 +1,6 @@
 import re
+import sqlite3
+from datetime import datetime
 import joblib
 import requests
 import numpy as np
@@ -10,6 +12,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
 HF_MODEL_ID = "abhinendra9792/distilbert-github-issue-classifier"
+DB_PATH = "triage_history.db"
 ID2LABEL = {0: "Bug", 1: "Feature Request", 2: "Documentation"}
 BADGE_STYLE = {
     "Bug": ("#ff4b4b", "rgba(255, 75, 75, 0.15)", "🐛 Bug"),
@@ -27,6 +30,47 @@ MEDIUM_PRIORITY_TERMS = {
 }
 
 st.set_page_config(page_title="GitHub Issue Triage (NLP-46)", page_icon="🛠️", layout="wide")
+
+# ---------------- SQLITE DATABASE ----------------
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS triage_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                source TEXT NOT NULL,
+                title TEXT NOT NULL,
+                predicted_label TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                model_used TEXT NOT NULL,
+                duplicate_status TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+def log_prediction(source: str, title: str, predicted_label: str, priority: str, confidence: str, model_used: str, duplicate_status: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO triage_logs (timestamp, source, title, predicted_label, priority, confidence, model_used, duplicate_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ts, source, str(title)[:150], predicted_label, priority, confidence, model_used, duplicate_status)
+        )
+        conn.commit()
+
+def fetch_logs() -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query("SELECT * FROM triage_logs ORDER BY id DESC", conn)
+
+def clear_logs():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM triage_logs")
+        conn.commit()
+
+init_db()
 
 # ---------------- CUSTOM CSS ----------------
 st.markdown("""
@@ -167,7 +211,8 @@ with st.sidebar:
         "• Classifier: Fine-tuned `distilbert-base-uncased`\n"
         "• Baseline: TF-IDF + Logistic Regression\n"
         "• Duplicates: `all-MiniLM-L6-v2` (SBERT) + Cosine Similarity\n"
-        "• Live Data: GitHub REST API"
+        "• Live Data: GitHub REST API\n"
+        "• Database: SQLite (`triage_history.db`)"
     )
 
 # ---------------- HERO BANNER ----------------
@@ -191,11 +236,12 @@ with k4:
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ---------------- TABS ----------------
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "✍️ Manual Issue Triage",
     "🔴 Live GitHub Repo Triage",
     "📂 Batch CSV Upload",
-    "📊 Model Evaluation"
+    "📊 Model Evaluation",
+    "🗄️ Triage History (DB)"
 ])
 
 # ---------------- TAB 1: MANUAL INPUT ----------------
@@ -227,6 +273,7 @@ with tab1:
             scores = cosine_similarity(q_emb, ref_embeddings)[0]
             top3_idx = np.argsort(scores)[::-1][:3]
             top_score = float(scores[top3_idx[0]])
+            dup_status_str = f"Duplicate ({top_score*100:.1f}%)" if top_score >= dup_threshold else f"Unique ({top_score*100:.1f}%)"
 
             st.markdown("---")
 
@@ -234,6 +281,16 @@ with tab1:
                 b_label, b_conf, b_probs = predict_distilbert(cleaned, tokenizer, bert_model)
                 t_label, t_conf, t_probs = predict_tfidf(cleaned, baseline_model)
                 p_text, p_col, p_bg = get_priority_tag(b_label, raw_text)
+
+                log_prediction(
+                    source="Manual",
+                    title=title_input or body_input[:60],
+                    predicted_label=b_label,
+                    priority=p_text,
+                    confidence=f"{b_conf*100:.1f}%",
+                    model_used="DistilBERT (Compare Mode)",
+                    duplicate_status=dup_status_str
+                )
 
                 st.markdown("#### ⚔️ Side-by-Side Model Comparison")
                 mc1, mc2 = st.columns(2)
@@ -262,10 +319,23 @@ with tab1:
             else:
                 if model_choice.startswith("DistilBERT"):
                     pred_label, conf, probs = predict_distilbert(cleaned, tokenizer, bert_model)
+                    used_model = "DistilBERT"
                 else:
                     pred_label, conf, probs = predict_tfidf(cleaned, baseline_model)
+                    used_model = "TF-IDF Baseline"
 
                 p_text, p_col, p_bg = get_priority_tag(pred_label, raw_text)
+
+                log_prediction(
+                    source="Manual",
+                    title=title_input or body_input[:60],
+                    predicted_label=pred_label,
+                    priority=p_text,
+                    confidence=f"{conf*100:.1f}%",
+                    model_used=used_model,
+                    duplicate_status=dup_status_str
+                )
+
                 left, right = st.columns([1, 1.35], gap="large")
 
                 with left:
@@ -298,7 +368,6 @@ with tab1:
 
                 pred_idx_for_explain = int(np.argmax(probs))
 
-            # If Compare Mode, show duplicates below the comparison
             if model_choice.startswith("⚔️"):
                 st.markdown("---")
                 st.markdown("#### 🔎 Top-3 Similar Existing Issues (SBERT)")
@@ -312,7 +381,6 @@ with tab1:
                     with st.expander(f"#{rank} · {sim:.1f}% Match · ({row['clean_label']}) {str(row['title'])[:80]}"):
                         st.write(str(row["body"])[:400] + "...")
 
-            # Preprocessing & Explainability Expander
             with st.expander("🧠 Show NLP Pipeline & Keyword Explainability"):
                 st.markdown("**1. Cleaned Text (After Regex Preprocessing):**")
                 st.code(cleaned, language="text")
@@ -323,6 +391,8 @@ with tab1:
                     st.markdown(kw_str)
                 else:
                     st.caption("No strong TF-IDF keyword weights found for this short input.")
+
+            st.caption("💾 Saved to SQLite database (`triage_history.db`). View in the **🗄️ Triage History (DB)** tab.")
 
 # ---------------- TAB 2: LIVE GITHUB REPO ----------------
 with tab2:
@@ -347,6 +417,8 @@ with tab2:
 
             rows = []
             label_counts = {"Bug": 0, "Feature Request": 0, "Documentation": 0}
+            used_model = "TF-IDF Baseline" if model_choice.startswith("TF-IDF") else "DistilBERT"
+
             for idx, issue in enumerate(live_issues):
                 if model_choice.startswith("TF-IDF"):
                     pred_label, conf, _ = predict_tfidf(cleaned_texts[idx], baseline_model)
@@ -362,6 +434,16 @@ with tab2:
                 best_sim = float(sims[best_match_idx])
                 dup_flag = f"⚠️ #{live_issues[best_match_idx]['number']} ({best_sim*100:.0f}%)" if best_sim >= dup_threshold else "✅ Unique"
 
+                log_prediction(
+                    source=f"GitHub: {repo_input.strip()}",
+                    title=f"#{issue['number']} {issue['title']}",
+                    predicted_label=pred_label,
+                    priority=priority_text,
+                    confidence=f"{conf*100:.1f}%",
+                    model_used=used_model,
+                    duplicate_status=dup_flag
+                )
+
                 rows.append({
                     "Issue #": f"#{issue['number']}",
                     "Title": issue["title"][:80],
@@ -373,9 +455,8 @@ with tab2:
                 })
 
             live_df = pd.DataFrame(rows)
-            st.success(f"Analyzed **{len(live_df)} live open issues** from `{repo_input}`.")
+            st.success(f"Analyzed & logged **{len(live_df)} live open issues** from `{repo_input}` to SQLite.")
 
-            # Live Repo Analytics Chart
             st.markdown("#### 📊 Live Category Breakdown")
             chart_df = pd.DataFrame.from_dict(label_counts, orient="index", columns=["Issues"])
             st.bar_chart(chart_df)
@@ -416,6 +497,7 @@ with tab3:
                 sub_df = batch_df.head(max_rows).copy()
                 preds, confs, priorities = [], [], []
                 progress = st.progress(0)
+                used_model = "TF-IDF Baseline" if model_choice.startswith("TF-IDF") else "DistilBERT"
 
                 for i, row in enumerate(sub_df.itertuples(index=False)):
                     t = getattr(row, "title", "")
@@ -430,13 +512,23 @@ with tab3:
                     preds.append(lbl)
                     confs.append(f"{cf*100:.1f}%")
                     priorities.append(prio)
+
+                    log_prediction(
+                        source="Batch CSV",
+                        title=str(t),
+                        predicted_label=lbl,
+                        priority=prio,
+                        confidence=f"{cf*100:.1f}%",
+                        model_used=used_model,
+                        duplicate_status="N/A (Batch)"
+                    )
                     progress.progress((i + 1) / len(sub_df))
 
                 sub_df["predicted_label"] = preds
                 sub_df["confidence"] = confs
                 sub_df["priority"] = priorities
 
-                st.success(f"Classified **{len(sub_df)} issues** successfully.")
+                st.success(f"Classified & logged **{len(sub_df)} issues** to SQLite.")
                 st.dataframe(sub_df, use_container_width=True, hide_index=True)
                 st.download_button(
                     label="⬇️ Download Labeled CSV",
@@ -473,3 +565,37 @@ with tab4:
         {"Issue Title": "desired fixes in inbo_rapport_2015: white space in section titles", "Actual": "Feature Request", "Predicted": "Bug", "Why It Happened": "Word 'fixes' strongly signals Bug to the classifier."},
     ])
     st.dataframe(error_df, use_container_width=True, hide_index=True)
+
+# ---------------- TAB 5: TRIAGE HISTORY (SQLITE DB) ----------------
+with tab5:
+    st.markdown("#### 🗄️ SQLite Database Logs (`triage_history.db`)")
+    logs_df = fetch_logs()
+
+    if logs_df.empty:
+        st.info("No predictions logged yet. Analyze an issue in **Manual Triage**, **Live GitHub Repo**, or **Batch CSV** to populate the database.")
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Logged Issues", len(logs_df))
+        m2.metric("Bugs", int((logs_df["predicted_label"] == "Bug").sum()))
+        m3.metric("Feature Requests", int((logs_df["predicted_label"] == "Feature Request").sum()))
+        m4.metric("Documentation", int((logs_df["predicted_label"] == "Documentation").sum()))
+
+        f1, f2 = st.columns(2)
+        cat_filter = f1.multiselect("Filter by Category", options=sorted(logs_df["predicted_label"].unique()), default=sorted(logs_df["predicted_label"].unique()))
+        src_filter = f2.multiselect("Filter by Source", options=sorted(logs_df["source"].unique()), default=sorted(logs_df["source"].unique()))
+
+        filtered_df = logs_df[logs_df["predicted_label"].isin(cat_filter) & logs_df["source"].isin(src_filter)]
+        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+
+        d1, d2 = st.columns([1, 4])
+        with d1:
+            st.download_button(
+                label="⬇️ Export DB (.csv)",
+                data=filtered_df.to_csv(index=False).encode("utf-8"),
+                file_name="sqlite_triage_history.csv",
+                mime="text/csv"
+            )
+        with d2:
+            if st.button("🗑️ Clear Database History"):
+                clear_logs()
+                st.rerun()
